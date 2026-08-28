@@ -547,6 +547,102 @@ def apply_memory_actions(line_user_id: str, actions: list):
                 )
 
 
+def _char_bigrams(text: str):
+    """
+    日本語の簡易類似判定用。
+    空白・記号・数字をある程度除いて2文字単位で比較する。
+    """
+    cleaned = re.sub(r'[\s\d/年月日。、！？!?・,.\-_:：]+', '', text or '')
+    if len(cleaned) < 2:
+        return {cleaned} if cleaned else set()
+    return {cleaned[i:i+2] for i in range(len(cleaned) - 1)}
+
+
+def backfill_explicit_schedule_date(
+    line_user_id: str,
+    user_message: str,
+    explicit_date: str
+):
+    """
+    AIがupdateアクションを返さなくても、
+    明示日付がある場合は既存schedule記憶から最も近いものを探して
+    event_dateだけ確実に補完する。
+    """
+    try:
+        schedules = (
+            supabase
+            .table("memories")
+            .select("id,memory,event_date,updated_at")
+            .eq("line_user_id", line_user_id)
+            .eq("status", "active")
+            .eq("category", "schedule")
+            .order("updated_at", desc=True)
+            .limit(30)
+            .execute()
+        ).data or []
+
+        if not schedules:
+            return False
+
+        user_bigrams = _char_bigrams(user_message)
+        best = None
+        best_score = 0.0
+
+        for item in schedules:
+            mem = item.get("memory", "")
+            mem_bigrams = _char_bigrams(mem)
+
+            if not user_bigrams or not mem_bigrams:
+                score = 0.0
+            else:
+                overlap = len(user_bigrams & mem_bigrams)
+                score = overlap / max(1, min(len(user_bigrams), len(mem_bigrams)))
+
+            if score > best_score:
+                best_score = score
+                best = item
+
+        # 例:
+        # 「9/3に美容院だよ」
+        # 「来週美容院の予約がある」
+        # なら「美容」「容院」等が一致する。
+        #
+        # scheduleが1件しかない場合は、明示日付を伝えている文脈として
+        # その1件を補完してよいと判断する。
+        if best and (best_score >= 0.18 or len(schedules) == 1):
+            (
+                supabase
+                .table("memories")
+                .update({
+                    "event_date": explicit_date,
+                    "updated_at": iso_now()
+                })
+                .eq("id", best["id"])
+                .execute()
+            )
+
+            print(
+                "SCHEDULE DATE BACKFILL:",
+                best["id"],
+                explicit_date,
+                "score=",
+                best_score
+            )
+            return True
+
+        print(
+            "SCHEDULE DATE BACKFILL SKIPPED:",
+            explicit_date,
+            "best_score=",
+            best_score
+        )
+        return False
+
+    except Exception as e:
+        print("Schedule Date Backfill Error:", repr(e))
+        return False
+
+
 def reorganize_long_term_memory(
     line_user_id: str,
     user_message: str,
@@ -709,6 +805,15 @@ importance:
             line_user_id,
             actions
         )
+
+        # AIがupdateを返さなかったケースでも、
+        # 明示日付があれば既存schedule記憶へコード側で補完する。
+        if explicit_date:
+            backfill_explicit_schedule_date(
+                line_user_id,
+                user_message,
+                explicit_date
+            )
 
     except Exception as e:
         # 記憶整理が失敗しても本体会話は止めない
@@ -957,7 +1062,7 @@ def index():
     return jsonify({
         "status": "ok",
         "message": "Akio is alive.",
-        "memory": "memory_v2_1_enabled"
+        "memory": "memory_v2_2_enabled"
     })
 
 
