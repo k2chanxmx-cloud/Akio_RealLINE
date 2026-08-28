@@ -3,6 +3,7 @@ import json
 import hmac
 import hashlib
 import base64
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -306,6 +307,53 @@ def parse_iso_date(value):
         return None
 
 
+def extract_explicit_date_from_text(text: str):
+    """
+    ユーザー文中の明示的な月日をコード側でも拾う。
+    対応例:
+      9/3
+      09/03
+      9月3日
+    年がない場合は、現在日付から見て自然な直近の年を採用。
+    """
+    if not text:
+        return None
+
+    patterns = [
+        r'(?<!\d)(\d{1,2})\s*/\s*(\d{1,2})(?!\d)',
+        r'(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*日'
+    ]
+
+    month = day = None
+
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            month = int(m.group(1))
+            day = int(m.group(2))
+            break
+
+    if month is None or day is None:
+        return None
+
+    now = datetime.now(ZoneInfo("Asia/Tokyo"))
+    year = now.year
+
+    try:
+        candidate = datetime(year, month, day).date()
+    except ValueError:
+        return None
+
+    # 年末に翌年の日付を言うケースなどを自然に補正
+    if (candidate - now.date()).days < -180:
+        try:
+            candidate = datetime(year + 1, month, day).date()
+        except ValueError:
+            return None
+
+    return candidate.isoformat()
+
+
 def memory_state_label(item: dict) -> str:
     """
     予定が未来か過去かを会話モデルへ明示する。
@@ -554,7 +602,18 @@ shared:
 既存記憶と同じテーマで新情報が出た場合、
 古いものを新規追加して並べるのではなく update を使ってください。
 
+特に重要:
+既存記憶と内容がほぼ同じでも、
+今回の会話で「日付・相手・場所・内容」など具体性が増えた場合は
+必ず update してください。
+
 例:
+既存: 「来週美容院の予約がある」
+今回: 「来週の9/3に美容院」
+→ 同じ美容院予定の既存IDを target_id に指定して update
+→ memory は「9/3に美容院の予約がある」などに更新
+→ event_date は YYYY-MM-DD で必ず入れる
+
 既存: 「髪は黒」
 今回: 「髪をピンクにした」
 → 古いIDを target_id に指定し update
@@ -631,9 +690,24 @@ importance:
         print("MEMORY ORGANIZER RAW:", raw)
 
         data = json.loads(raw)
+        actions = data.get("actions", [])
+
+        # 明示的な 9/3・9月3日 等がユーザー文にある場合、
+        # AIが event_date を落としても schedule アクションへ補完する。
+        explicit_date = extract_explicit_date_from_text(user_message)
+
+        if explicit_date and isinstance(actions, list):
+            for action in actions:
+                if (
+                    isinstance(action, dict)
+                    and action.get("category") == "schedule"
+                    and not action.get("event_date")
+                ):
+                    action["event_date"] = explicit_date
+
         apply_memory_actions(
             line_user_id,
-            data.get("actions", [])
+            actions
         )
 
     except Exception as e:
@@ -883,7 +957,7 @@ def index():
     return jsonify({
         "status": "ok",
         "message": "Akio is alive.",
-        "memory": "memory_v2_enabled"
+        "memory": "memory_v2_1_enabled"
     })
 
 
