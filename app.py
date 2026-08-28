@@ -67,19 +67,25 @@ AKIO_PROMPT = """
 説明文ではなく、実際に彼氏から届くLINEとして返答してください。
 
 【口調】
-・最初から最後まで完全なタメ口。
-・敬語は絶対に使わない。
-・「〜してください」「〜しましょう」「〜ですよ」「〜ですね」「〜してくださいね」などは禁止。
-・「〜だ」「〜だろ」「〜しろ」「〜するな」「〜じゃねえか」「〜ってわけだ」「ったく」などを自然に使う。
-・少し偉そうで上から目線。
-・軽く煽ったり茶化したりしてもいい。
-・ただし罵倒、人格否定、傷つけるような言い方はしない。
-・優しさを直接アピールせず、ぶっきらぼうな気遣いとして表現する。
-・褒める場合も「偉いね」ではなく「ちゃんとやってんじゃねえか」「悪くねえ」など、このキャラクターらしい言い方にする。
-・同じ語尾を連発しない。
+・最初から最後までタメ口
+・敬語は基本的に使わない
+・少しぶっきらぼうで、ツンとした話し方
+・ただし「ツンデレを演じること」より自然なLINE会話を最優先する
+・毎回わざと乱暴な語尾を付けない
+・「〜だろ」「〜じゃねえか」「ったく」等は、その場面で自然な時だけ使う
+・軽く煽ったり茶化したりすることがある
+・罵倒や人格否定はしない
+・心配している時も過剰に優しい言葉へ変換しない
+・同じ言葉、同じ語尾、同じ反応を短期間に繰り返さない
+・「悪くねえ」「ちゃんとやってんじゃねえか」等の決まったキャラ台詞を繰り返さない
+・普通に「おう」「ん」「そっか」「まじか」「よかったじゃん」なども使う
 
 【基本的な性格】
-
+・キャラクター性を見せるためだけの発言をしない
+・相手の発言が普通なら普通に返す
+・常に気の利いたことを言おうとしない
+・会話を無理に続けようとしない
+・毎回心配したりアドバイスしたりしない
 ・ツンデレ
 ・自然体
 ・優しい
@@ -248,6 +254,178 @@ def get_recent_messages(
 
 
 # =========================================================
+# 長期記憶
+# =========================================================
+
+def get_long_term_memories(line_user_id: str, limit: int = 30):
+    """重要度の高い長期記憶を取得する。"""
+    try:
+        result = (
+            supabase
+            .table("memories")
+            .select("id,memory,category,importance,created_at,updated_at")
+            .eq("line_user_id", line_user_id)
+            .order("importance", desc=True)
+            .order("updated_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return result.data or []
+    except Exception as e:
+        print("Supabase Memory Read Error:", repr(e))
+        return []
+
+
+def normalize_memory_text(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def save_memory_if_new(
+    line_user_id: str,
+    memory: str,
+    category: str = "other",
+    importance: int = 5
+):
+    """完全一致・ほぼ同一の短文記憶の増殖を防いで保存する。"""
+    memory = (memory or "").strip()
+    if not memory:
+        return
+
+    category = (category or "other").strip()[:50]
+    importance = max(1, min(int(importance or 5), 10))
+
+    try:
+        existing = (
+            supabase
+            .table("memories")
+            .select("id,memory,category,importance")
+            .eq("line_user_id", line_user_id)
+            .limit(100)
+            .execute()
+        ).data or []
+
+        normalized = normalize_memory_text(memory)
+
+        for item in existing:
+            old = normalize_memory_text(item.get("memory", ""))
+            if old == normalized:
+                # 同じ記憶なら重要度だけ必要に応じて更新
+                if importance > int(item.get("importance") or 5):
+                    (
+                        supabase
+                        .table("memories")
+                        .update({
+                            "importance": importance,
+                            "updated_at": datetime.now(ZoneInfo("UTC")).isoformat()
+                        })
+                        .eq("id", item["id"])
+                        .execute()
+                    )
+                return
+
+        supabase.table("memories").insert({
+            "line_user_id": line_user_id,
+            "memory": memory,
+            "category": category,
+            "importance": importance
+        }).execute()
+
+    except Exception as e:
+        print("Supabase Memory Save Error:", repr(e))
+
+
+def extract_and_save_memories(
+    line_user_id: str,
+    user_message: str,
+    assistant_message: str
+):
+    """
+    会話から、数日～数か月後にも役立つユーザー情報だけを抽出して保存する。
+    返信処理とは分離し、失敗してもLINE返信には影響させない。
+    """
+    existing = get_long_term_memories(line_user_id, limit=50)
+    existing_text = "\n".join(
+        f"- [{m.get('category', 'other')}] {m.get('memory', '')}"
+        for m in existing
+        if m.get("memory")
+    )
+
+    memory_instructions = """
+あなたは会話の長期記憶を整理する内部処理です。
+ユーザー本人について、今後の会話で役立つ情報だけを抽出してください。
+
+保存候補:
+・継続的な趣味、好み、習慣
+・仕事や生活上の継続的な情報
+・重要な人物や人間関係
+・将来の具体的な予定
+・今後参照されそうな出来事
+・ユーザーが明確に覚えておいてほしいと述べた内容
+
+原則保存しない:
+・「眠い」「腹減った」など一時的な状態
+・挨拶、相槌、雑談だけの内容
+・あきお側の設定や発言
+・既存記憶と実質的に同じ情報
+・推測した情報
+・会話から確実に言えない情報
+
+category は preference, hobby, relationship, work, schedule, event, other のいずれか。
+importance は1～10。長く役立つほど高くしてください。
+
+必ずJSONだけを返してください。
+{
+  "memories": [
+    {
+      "memory": "簡潔な事実",
+      "category": "hobby",
+      "importance": 7
+    }
+  ]
+}
+
+保存するものがなければ {"memories": []} としてください。
+"""
+
+    payload = f"""
+【既存の長期記憶】
+{existing_text if existing_text else "なし"}
+
+【今回のユーザー発言】
+{user_message}
+
+【今回のあきおの返答】
+{assistant_message}
+"""
+
+    try:
+        response = client.responses.create(
+            model="gpt-5-mini",
+            instructions=memory_instructions,
+            input=payload
+        )
+        raw = response.output_text.strip()
+        data = json.loads(raw)
+        memories = data.get("memories", [])
+
+        if not isinstance(memories, list):
+            return
+
+        for item in memories[:5]:
+            if not isinstance(item, dict):
+                continue
+            save_memory_if_new(
+                line_user_id=line_user_id,
+                memory=item.get("memory", ""),
+                category=item.get("category", "other"),
+                importance=item.get("importance", 5)
+            )
+
+    except Exception as e:
+        print("Memory Extraction Error:", repr(e))
+
+
+# =========================================================
 # OpenAI
 # =========================================================
 
@@ -292,6 +470,28 @@ def generate_akio_reply(
         line_user_id,
         limit=20
     )
+
+    long_term_memories = get_long_term_memories(
+        line_user_id,
+        limit=30
+    )
+
+    if long_term_memories:
+        memory_lines = "\n".join(
+            f"- {item.get('memory', '')}"
+            for item in long_term_memories
+            if item.get("memory")
+        )
+
+        instructions += f"""
+
+【長期記憶】
+{memory_lines}
+
+これは過去に自然に知ったユーザーの情報です。
+必要な場面でだけ自然に使ってください。
+関係のない話題で無理に持ち出さないでください。
+"""
 
     conversation = []
 
@@ -459,7 +659,7 @@ def index():
     return jsonify({
         "status": "ok",
         "message": "Akio is alive.",
-        "memory": "enabled"
+        "memory": "short_and_long_term_enabled"
     })
 
 
@@ -630,6 +830,16 @@ def callback():
         save_message(
             line_user_id,
             "assistant",
+            assistant_content
+        )
+
+        # -----------------------------------------
+        # 長期記憶候補を抽出・保存
+        # 失敗してもLINE返信自体には影響しない
+        # -----------------------------------------
+        extract_and_save_memories(
+            line_user_id,
+            user_message,
             assistant_content
         )
 
