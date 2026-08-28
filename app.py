@@ -1062,7 +1062,8 @@ def index():
     return jsonify({
         "status": "ok",
         "message": "Akio is alive.",
-        "memory": "memory_v2_2_enabled"
+        "memory": "memory_v2_2_enabled",
+        "proactive": "github_actions_enabled"
     })
 
 
@@ -1247,6 +1248,52 @@ def callback():
         )
 
     return "OK", 200
+
+
+
+# =========================================================
+# あきお自発LINE（GitHub Actionsから呼び出し）
+# =========================================================
+
+@app.route("/internal/proactive", methods=["POST"])
+def internal_proactive():
+    """
+    GitHub Actions専用。
+    Authorization: Bearer <PROACTIVE_SECRET> が一致した時だけ、
+    proactive.py の自発LINE判定を1回実行する。
+    """
+    proactive_secret = os.environ.get("PROACTIVE_SECRET")
+
+    if not proactive_secret:
+        print("PROACTIVE_SECRET is not configured")
+        return jsonify({
+            "status": "error",
+            "message": "proactive secret is not configured"
+        }), 503
+
+    auth_header = request.headers.get("Authorization", "")
+    expected = f"Bearer {proactive_secret}"
+
+    if not hmac.compare_digest(auth_header, expected):
+        print("Proactive endpoint unauthorized")
+        abort(401)
+
+    try:
+        # 起動時ではなく呼ばれた時だけ読み込む
+        from proactive import main as run_proactive
+        run_proactive()
+
+        return jsonify({
+            "status": "ok",
+            "message": "Akio proactive check completed."
+        }), 200
+
+    except Exception as e:
+        print("Proactive Endpoint Error:", repr(e))
+        return jsonify({
+            "status": "error",
+            "message": "proactive check failed"
+        }), 500
 
 
 # =========================================================
