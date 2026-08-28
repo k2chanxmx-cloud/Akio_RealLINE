@@ -254,17 +254,34 @@ def get_recent_messages(
 
 
 # =========================================================
-# 長期記憶
+# 長期記憶 v2
 # =========================================================
 
-def get_long_term_memories(line_user_id: str, limit: int = 30):
-    """重要度の高い長期記憶を取得する。"""
+MEMORY_CATEGORIES = {
+    "preference", "hobby", "relationship", "work",
+    "schedule", "event", "profile", "akio_profile",
+    "shared_memory", "other"
+}
+
+def iso_now():
+    return datetime.now(ZoneInfo("UTC")).isoformat()
+
+
+def get_long_term_memories(line_user_id: str, limit: int = 40):
+    """
+    activeな記憶を重要度順に取得。
+    event_date が過ぎていても削除はせず、会話時に「過去」として扱う。
+    """
     try:
         result = (
             supabase
             .table("memories")
-            .select("id,memory,category,importance,created_at,updated_at")
+            .select(
+                "id,line_user_id,memory,category,importance,"
+                "subject,status,event_date,created_at,updated_at"
+            )
             .eq("line_user_id", line_user_id)
+            .eq("status", "active")
             .order("importance", desc=True)
             .order("updated_at", desc=True)
             .limit(limit)
@@ -276,120 +293,326 @@ def get_long_term_memories(line_user_id: str, limit: int = 30):
         return []
 
 
-def normalize_memory_text(text: str) -> str:
-    return " ".join((text or "").strip().lower().split())
+def normalize_memory_text(value: str) -> str:
+    return " ".join((value or "").strip().lower().split())
 
 
-def save_memory_if_new(
-    line_user_id: str,
-    memory: str,
-    category: str = "other",
-    importance: int = 5
-):
-    """完全一致・ほぼ同一の短文記憶の増殖を防いで保存する。"""
-    memory = (memory or "").strip()
-    if not memory:
-        return
-
-    category = (category or "other").strip()[:50]
-    importance = max(1, min(int(importance or 5), 10))
-
+def parse_iso_date(value):
+    if not value:
+        return None
     try:
-        existing = (
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def memory_state_label(item: dict) -> str:
+    """
+    予定が未来か過去かを会話モデルへ明示する。
+    """
+    event_date = parse_iso_date(item.get("event_date"))
+    if not event_date:
+        return ""
+
+    today = datetime.now(ZoneInfo("Asia/Tokyo")).date()
+    if event_date < today:
+        return " [日付経過済み・過去の予定/出来事]"
+    if event_date == today:
+        return " [今日]"
+    return " [今後の予定]"
+
+
+def build_memory_context(memories: list) -> str:
+    if not memories:
+        return "なし"
+
+    lines = []
+    for item in memories:
+        memory = (item.get("memory") or "").strip()
+        if not memory:
+            continue
+
+        subject = item.get("subject") or "user"
+        category = item.get("category") or "other"
+        date_text = item.get("event_date") or ""
+        state = memory_state_label(item)
+
+        prefix = {
+            "user": "ユーザー",
+            "akio": "あきお",
+            "shared": "二人"
+        }.get(subject, subject)
+
+        extra = f" / 日付:{date_text}" if date_text else ""
+        lines.append(
+            f"- [{prefix}/{category}] {memory}{extra}{state}"
+        )
+
+    return "\n".join(lines) if lines else "なし"
+
+
+def archive_memory(memory_id: int):
+    try:
+        (
             supabase
             .table("memories")
-            .select("id,memory,category,importance")
-            .eq("line_user_id", line_user_id)
-            .limit(100)
+            .update({
+                "status": "archived",
+                "updated_at": iso_now()
+            })
+            .eq("id", memory_id)
             .execute()
-        ).data or []
+        )
+    except Exception as e:
+        print("Supabase Memory Archive Error:", repr(e))
 
-        normalized = normalize_memory_text(memory)
 
-        for item in existing:
-            old = normalize_memory_text(item.get("memory", ""))
-            if old == normalized:
-                # 同じ記憶なら重要度だけ必要に応じて更新
-                if importance > int(item.get("importance") or 5):
-                    (
-                        supabase
-                        .table("memories")
-                        .update({
-                            "importance": importance,
-                            "updated_at": datetime.now(ZoneInfo("UTC")).isoformat()
-                        })
-                        .eq("id", item["id"])
-                        .execute()
-                    )
-                return
+def update_memory(
+    memory_id: int,
+    memory: str,
+    category: str,
+    importance: int,
+    subject: str,
+    event_date=None
+):
+    try:
+        (
+            supabase
+            .table("memories")
+            .update({
+                "memory": memory,
+                "category": category,
+                "importance": importance,
+                "subject": subject,
+                "event_date": event_date,
+                "status": "active",
+                "updated_at": iso_now()
+            })
+            .eq("id", memory_id)
+            .execute()
+        )
+    except Exception as e:
+        print("Supabase Memory Update Error:", repr(e))
 
+
+def insert_memory(
+    line_user_id: str,
+    memory: str,
+    category: str,
+    importance: int,
+    subject: str,
+    event_date=None
+):
+    try:
         supabase.table("memories").insert({
             "line_user_id": line_user_id,
             "memory": memory,
             "category": category,
-            "importance": importance
+            "importance": importance,
+            "subject": subject,
+            "status": "active",
+            "event_date": event_date
         }).execute()
-
     except Exception as e:
-        print("Supabase Memory Save Error:", repr(e))
+        print("Supabase Memory Insert Error:", repr(e))
 
 
-def extract_and_save_memories(
+def apply_memory_actions(line_user_id: str, actions: list):
+    """
+    記憶整理AIが返した action をDBへ反映する。
+    action:
+      add     -> 新規
+      update  -> target_idを書き換え
+      archive -> target_idを無効化
+    """
+    if not isinstance(actions, list):
+        return
+
+    for action in actions[:8]:
+        if not isinstance(action, dict):
+            continue
+
+        kind = str(action.get("action", "")).lower().strip()
+        memory = str(action.get("memory", "") or "").strip()
+        category = str(action.get("category", "other") or "other").strip()
+        subject = str(action.get("subject", "user") or "user").strip()
+        event_date = action.get("event_date")
+
+        try:
+            importance = int(action.get("importance", 5))
+        except Exception:
+            importance = 5
+
+        importance = max(1, min(importance, 10))
+
+        if category not in MEMORY_CATEGORIES:
+            category = "other"
+
+        if subject not in ("user", "akio", "shared"):
+            subject = "user"
+
+        # 日付は YYYY-MM-DD 以外なら破棄
+        if event_date:
+            parsed = parse_iso_date(event_date)
+            event_date = parsed.isoformat() if parsed else None
+
+        target_id = action.get("target_id")
+        try:
+            target_id = int(target_id) if target_id is not None else None
+        except Exception:
+            target_id = None
+
+        if kind == "archive":
+            if target_id:
+                archive_memory(target_id)
+            continue
+
+        if kind == "update":
+            if target_id and memory:
+                update_memory(
+                    target_id,
+                    memory,
+                    category,
+                    importance,
+                    subject,
+                    event_date
+                )
+            continue
+
+        if kind == "add" and memory:
+            # 完全一致だけは念のためコード側でも弾く
+            existing = get_long_term_memories(line_user_id, limit=100)
+            normalized = normalize_memory_text(memory)
+            duplicate = any(
+                normalize_memory_text(x.get("memory", "")) == normalized
+                and (x.get("subject") or "user") == subject
+                for x in existing
+            )
+            if not duplicate:
+                insert_memory(
+                    line_user_id,
+                    memory,
+                    category,
+                    importance,
+                    subject,
+                    event_date
+                )
+
+
+def reorganize_long_term_memory(
     line_user_id: str,
     user_message: str,
     assistant_message: str
 ):
     """
-    会話から、数日～数か月後にも役立つユーザー情報だけを抽出して保存する。
-    返信処理とは分離し、失敗してもLINE返信には影響させない。
+    会話後に、既存記憶との照合・追加・更新・アーカイブを一括判定する。
+    ユーザー情報だけでなく、明示的に確定したあきお設定と
+    二人の重要な出来事も扱う。
     """
-    existing = get_long_term_memories(line_user_id, limit=50)
-    existing_text = "\n".join(
-        f"- [{m.get('category', 'other')}] {m.get('memory', '')}"
-        for m in existing
-        if m.get("memory")
-    )
+    existing = get_long_term_memories(line_user_id, limit=80)
+    existing_text = build_memory_context(existing)
+    today = datetime.now(ZoneInfo("Asia/Tokyo")).date().isoformat()
 
-    memory_instructions = """
-あなたは会話の長期記憶を整理する内部処理です。
-ユーザー本人について、今後の会話で役立つ情報だけを抽出してください。
+    memory_instructions = f"""
+あなたはAI彼氏アプリ内部の「長期記憶整理係」です。
+今日は {today} です。
 
-保存候補:
-・継続的な趣味、好み、習慣
-・仕事や生活上の継続的な情報
-・重要な人物や人間関係
-・将来の具体的な予定
-・今後参照されそうな出来事
-・ユーザーが明確に覚えておいてほしいと述べた内容
+今回の会話と既存記憶を比較し、必要な変更だけをJSONで返してください。
 
-原則保存しない:
-・「眠い」「腹減った」など一時的な状態
-・挨拶、相槌、雑談だけの内容
-・あきお側の設定や発言
-・既存記憶と実質的に同じ情報
-・推測した情報
-・会話から確実に言えない情報
+【subject】
+user:
+  ユーザー本人についての事実・好み・予定・人物関係など。
 
-category は preference, hobby, relationship, work, schedule, event, other のいずれか。
-importance は1～10。長く役立つほど高くしてください。
+akio:
+  あきお自身について、会話の中で明確に確定した設定だけ。
+  あきおがその場の雰囲気で適当に言った行動や設定は保存しない。
+  例: ユーザーが「あきおって○○の仕事だよね」と確認し、
+      あきおが肯定した等、継続性が必要な設定。
 
-必ずJSONだけを返してください。
-{
-  "memories": [
-    {
+shared:
+  二人の関係にとって今後振り返る価値のある出来事。
+  普通の挨拶や毎日の雑談は保存しない。
+
+【保存価値がある例】
+・趣味、好み、継続習慣
+・仕事や生活上の継続情報
+・重要な人物・人間関係
+・日付がある予定
+・今後振り返りそうな重要イベント
+・ユーザーが明示的に覚えてほしい内容
+・既存記憶を変更する新情報
+
+【保存しない例】
+・眠い、腹減った等の一時状態
+・挨拶や相槌
+・単なる短期雑談
+・推測
+・ユーザーが言っていない事実
+・あきおが会話を成立させるため一時的に作った設定
+
+【矛盾・更新】
+既存記憶と同じテーマで新情報が出た場合、
+古いものを新規追加して並べるのではなく update を使ってください。
+
+例:
+既存: 「髪は黒」
+今回: 「髪をピンクにした」
+→ 古いIDを target_id に指定し update
+
+既存: 「キックボクシングに通っている」
+今回: 「キックボクシング辞めた」
+→ その事実を今後も意味のある履歴として残すなら
+  「以前キックボクシングに通っていたが、現在は辞めている」へ update。
+  不要なら archive。
+
+【予定】
+具体的な日付が判断できる場合のみ event_date を YYYY-MM-DD で入れてください。
+「明日」「来週土曜」等は今日の日付から計算してください。
+判断不能なら null。
+予定日を過ぎても、勝手に「実行した」と断定しないでください。
+
+【action】
+add:
+ 新しい記憶を追加。
+
+update:
+ 既存記憶を置き換える。必ず target_id を指定。
+
+archive:
+ 古い記憶を無効化する。必ず target_id を指定。
+
+none:
+ 出力には含めない。
+
+category:
+ preference, hobby, relationship, work, schedule, event,
+ profile, akio_profile, shared_memory, other
+
+importance:
+ 1～10。長期間役立つ、関係上重要なほど高い。
+
+必ずJSONのみ:
+{{
+  "actions": [
+    {{
+      "action": "add",
+      "target_id": null,
+      "subject": "user",
       "memory": "簡潔な事実",
       "category": "hobby",
-      "importance": 7
-    }
+      "importance": 8,
+      "event_date": null
+    }}
   ]
-}
+}}
 
-保存するものがなければ {"memories": []} としてください。
+変更不要なら:
+{{"actions":[]}}
 """
 
     payload = f"""
 【既存の長期記憶】
-{existing_text if existing_text else "なし"}
+{existing_text}
 
 【今回のユーザー発言】
 {user_message}
@@ -405,24 +628,17 @@ importance は1～10。長く役立つほど高くしてください。
             input=payload
         )
         raw = response.output_text.strip()
+        print("MEMORY ORGANIZER RAW:", raw)
+
         data = json.loads(raw)
-        memories = data.get("memories", [])
-
-        if not isinstance(memories, list):
-            return
-
-        for item in memories[:5]:
-            if not isinstance(item, dict):
-                continue
-            save_memory_if_new(
-                line_user_id=line_user_id,
-                memory=item.get("memory", ""),
-                category=item.get("category", "other"),
-                importance=item.get("importance", 5)
-            )
+        apply_memory_actions(
+            line_user_id,
+            data.get("actions", [])
+        )
 
     except Exception as e:
-        print("Memory Extraction Error:", repr(e))
+        # 記憶整理が失敗しても本体会話は止めない
+        print("Memory Organizer Error:", repr(e))
 
 
 # =========================================================
@@ -473,24 +689,32 @@ def generate_akio_reply(
 
     long_term_memories = get_long_term_memories(
         line_user_id,
-        limit=30
+        limit=40
     )
 
     if long_term_memories:
-        memory_lines = "\n".join(
-            f"- {item.get('memory', '')}"
-            for item in long_term_memories
-            if item.get("memory")
-        )
+        memory_lines = build_memory_context(long_term_memories)
 
         instructions += f"""
 
 【長期記憶】
 {memory_lines}
 
-これは過去に自然に知ったユーザーの情報です。
+ここにはユーザー本人、あきお自身の確定設定、
+二人の重要な出来事が含まれる場合があります。
+
 必要な場面でだけ自然に使ってください。
 関係のない話題で無理に持ち出さないでください。
+
+「日付経過済み」と書かれた予定について、
+まだ未来の予定であるかのように話してはいけません。
+また、予定日を過ぎたというだけで実行済みと断定せず、
+必要なら「どうだった？」のように自然に確認してください。
+
+記憶同士に食い違いがある場合は、
+更新日時や会話の新しい情報を優先してください。
+
+記憶DB、保存、履歴、システム等の存在は口に出さないでください。
 """
 
     conversation = []
@@ -659,7 +883,7 @@ def index():
     return jsonify({
         "status": "ok",
         "message": "Akio is alive.",
-        "memory": "short_and_long_term_enabled"
+        "memory": "memory_v2_enabled"
     })
 
 
@@ -837,7 +1061,7 @@ def callback():
         # 長期記憶候補を抽出・保存
         # 失敗してもLINE返信自体には影響しない
         # -----------------------------------------
-        extract_and_save_memories(
+        reorganize_long_term_memory(
             line_user_id,
             user_message,
             assistant_content
